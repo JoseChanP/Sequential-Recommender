@@ -1,89 +1,68 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from src import load_and_process_data, SASRecDatasetOptimized, SASRecModel, HybridRecommender
+from src import SASRecModel, SASRecDatasetSeq
+from src import load_data_and_mappings, build_seq_tensors
 import time
 
 # Config
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MAX_LEN = 50
-BATCH_SIZE = 2048
-EPOCHS = 3
+BATCH_SIZE = 32
+EPOCHS = 20
+MAX_LEN = 200
 LR = 0.001
+ACCUMULATION_STEPS = 4
 
 def main():
-    # 1. Load Data
-    data = load_and_process_data('data/ratings.csv', 'data/movies.csv')
+    # 1. Prepare Data
+    ratings, mappings = load_data_and_mappings('data/ratings.csv', 'data/movies.csv')
     
-    genre_tensor = data['genre_tensor'].to(DEVICE)
-    year_tensor = data['year_tensor'].to(DEVICE)
-
-    # 2. Setup Dataset
-    train_dataset = SASRecDatasetOptimized(
-        data['train_timeline'], 
-        data['genre_tensor'], 
-        data['year_tensor'], 
-        max_len=MAX_LEN
-    )
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
-
-    # 3. Initialize Model
+    # 2. Build Sequence Tensors
+    train_in, train_gen, train_yr, train_tgt = build_seq_tensors(ratings, mappings, max_len=MAX_LEN)
+    
+    # 3. Create Minimal Dataset
+    train_ds = SASRecDatasetSeq(train_in, train_gen, train_yr, train_tgt)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=0)
+    
+    # 4. Model
     model = SASRecModel(
-        num_movies=data['num_movies'], 
-        num_genres=data['num_genres'], 
-        num_years=13, # 13 buckets defined in utils
-        embed_dim=256, 
+        num_movies=mappings['num_movies'],
+        num_genres=mappings['num_genres'],
+        num_years=mappings['num_years'],
+        embed_dim=256,
         max_len=MAX_LEN
     ).to(DEVICE)
-
+    print(mappings['num_movies'], mappings['num_genres'], mappings['num_years'])
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
     scaler = torch.amp.GradScaler('cuda')
-
-    # 4. Training Loop
-    print(f"Starting training on {DEVICE}...")
+    
+    print(f"Starting Training on {len(train_ds)} sequences...")
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
+        t0 = time.time()
         
-        for batch_idx, batch in enumerate(train_loader):
-            m, g, y, t = [b.to(DEVICE) for b in batch]
-            
-            if t.sum() == 0: continue
+        for i, (m, g, y, t) in enumerate(train_loader):
+            m, g, y, t = m.to(DEVICE), g.to(DEVICE), y.to(DEVICE), t.to(DEVICE)
             
             optimizer.zero_grad()
             with torch.amp.autocast('cuda'):
                 logits = model(m, g, y)
-                loss = criterion(logits, t)
+                loss = criterion(logits.view(-1, mappings['num_movies']), t.view(-1))
+                loss = loss / ACCUMULATION_STEPS
             
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
             total_loss += loss.item()
+            if (i + 1) % ACCUMULATION_STEPS == 0:
+                scaler.step(optimizer)
+                scaler.update()
             
-            if batch_idx % 50 == 0:
-                print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss {loss.item():.4f}")
-
-    # 5. Save Model
+        print(f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Time: {time.time()-t0:.1f}s")
+        
     torch.save(model.state_dict(), "sasrec_model.pth")
-    print("Model saved to sasrec_model.pth")
-
-    # 6. Example Inference (Sanity Check)
-    print("\n--- Running Inference Check ---")
-    recommender = HybridRecommender(
-        model, 
-        data['ar2_transitions'], 
-        data['global_pop'], 
-        data['movie_to_idx'], 
-        data['idx_to_movie'], 
-        DEVICE
-    )
-    
-    # Test Cold Start (AR2)
-    short_history = ['1', '2'] # Assuming these IDs exist
-    recs = recommender.recommend(short_history, genre_tensor, year_tensor)
-    print(f"Short History {short_history} -> Recs: {recs}")
+    print("Model Saved.")
 
 if __name__ == "__main__":
     main()
